@@ -1,5 +1,5 @@
 ================================================================================
-README: eos.ipynb — Earning Opportunities Consolidation
+Earning Opportunities Consolidation
 Umuzi x IDC Impact Report Pipeline
 ================================================================================
 
