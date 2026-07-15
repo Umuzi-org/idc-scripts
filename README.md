@@ -1,212 +1,194 @@
-================================================================================
-README: IDC Reporting Repository
-Umuzi Data Team
-================================================================================
+# idc-scripts
 
-This repository contains all scripts, queries, and notebooks used to produce
-Umuzi's quarterly IDC (Industrial Development Corporation) impact report. It is
-the single source of truth for the technical reporting pipeline and is designed
-to be runnable, understandable, and maintainable by anyone on the data team —
-without needing to track down the original author.
+Scripts, queries, and notebooks that produce Umuzi's monthly/quarterly IDC
+(Industrial Development Corporation of South Africa Ltd) impact report. The pipeline covers two
+reporting arms — **Support Services** (Indicators 5, 6, 7) and **Earning
+Opportunities** — and assembles both into a single partner-facing workbook,
+`IDC Report Consolidated Y2.xlsx`.
 
-The repository is organised into three folders, each corresponding to a distinct
-phase of the reporting pipeline. They should be run in the order listed below.
+The notebooks are built to be run by anyone on the data team. Every drop is
+printed, every assumption is validated, and when something is wrong the run
+halts with a table that says what broke and which CONFIG entry or source file
+to fix. If a notebook completes silently, the numbers can be trusted; if it
+halts, read the last table — it was written for you.
 
+---
 
---------------------------------------------------------------------------------
-REPOSITORY STRUCTURE
---------------------------------------------------------------------------------
+## What this repository is (and is not)
 
+This repo is the **home of the code only**: three notebooks, three SQL
+queries, and the database helper modules. **No data lives here and none
+should ever be committed** — no source submissions, no exports, no `.env`,
+no output workbooks.
+
+All data lives in a **data root on your own machine** (referred to as `BASE`
+throughout the notebooks). You set it up once, add a folder per reporting
+month, and point each notebook's CONFIG cell at it. Setup is described below.
+
+## Repository layout
+
+```
 idc-scripts/
-├── earning/          Notebook for consolidating Earning Opportunities (EO) data
-├── support/          Notebooks for consolidating Support Services data
-└── consolidate/      Final assembly: combines all outputs into the IDC report
+├── queries/       SQL run against the production database each cycle
+│   ├── populate_fields.sql     -> db_fields.csv (the enrichment table)
+│   ├── idc_indicator_5.sql     -> indicator_5.csv
+│   └── idc_indicator_7.sql     -> indicator_7.csv (database-logged services)
+├── support/       support_services_consolidated.ipynb
+│                  (all support service sources -> indicator_7_data.csv)
+├── consolidate/   indicators_consolidated.ipynb
+│                  (Indicators 5, 6, 7 + Participants -> creates the workbook)
+└── earning/       eos_refactored.ipynb + database helper modules
+                   (earning opportunities -> appends 5 sheets to the workbook)
+```
 
+---
 
---------------------------------------------------------------------------------
-FOLDER: earning/
---------------------------------------------------------------------------------
+## One-time setup (per person / per machine)
 
-PURPOSE
-  Consolidates earning opportunity data from six internal Umuzi teams into a
-  single enriched output for the IDC report. An earning opportunity is any
-  instance in which Umuzi has connected a learner to a paid engagement — a gig,
-  placement, stipend, or freelance contract.
+**1. Clone the repo and install dependencies**
 
-NOTEBOOK
-  eos.ipynb
+```
+pip install pandas numpy openpyxl psycopg2-binary python-dotenv
+```
 
-INPUTS
+**2. Create `earning/.env`** (never commit it) with the database credentials
+used by the programme-name lookup:
 
-- Excel/CSV trackers from: XPL/Natalie, Milestone/Finance, Partnerships,
-    Launch Lab, Community Team, SAP Team, and Umuzi Interns
-- Previous cycle's rolling CSV (exported at the end of the prior run)
-- Enrichment CSV generated from support/populate_fields.sql
+```
+dbname=...
+user=...
+password=...
+host=...
+port=...
+```
 
-OUTPUTS (written to IDC Report Consolidated.xlsx)
+**3. Create your data root (`BASE`).** Any folder works — e.g.
+`~/Documents/Umuzi/Reporting`. It must contain:
 
-- Learner Demographics
-- One Per Learner
-- Monthly Entries Breakdown
-- Summarized Opportunities
-- Earning Opportunities Secured
+```
+<BASE>/
+├── Improved IDC/
+│   ├── Categories/Support/
+│   │   └── db_fields.csv          <- export of queries/populate_fields.sql
+│   └── Email Matching/
+│       └── emails.csv             <- secondary enrichment export
+└── Monthly IDC/
+    ├── June (2026)/               <- one folder per reporting month
+    │   ├── Database/              <- exports of indicator_5.sql, indicator_7.sql
+    │   ├── Source Datasets/       <- the data owners' submissions for the month
+    │   └── Sink Datasets/         <- everything the notebooks write (auto-created)
+    └── ...
+```
 
-README
-  See earning/README.txt for full documentation of inputs, pipeline steps,
-  output schemas, and the per-cycle run checklist.
+Older month folders may also contain `Earning/`, `Support/`, `Consolidate/`
+subfolders — those are legacy homes of per-month notebook copies from before
+this repo was the canonical code location. They are harmless and not needed
+for new months.
 
-RUN ORDER
-  Run this folder's notebook before consolidate/. It can be run independently
-  of the support/ folder — both write to the same output Excel file in
-  append/replace mode, so order between the two does not matter. If you can, hold off on writing the output till you're done with the consolidate folder.
+> **Folder naming warning:** historical month folders are inconsistent —
+> some have a space before the parenthesis (`June (2026)`), some do not
+> (`May(2026)`). The notebooks do not guess: `MONTH_DIR` in each CONFIG must
+> match what is actually on disk. Pick one convention for new months and
+> stick to it.
 
---------------------------------------------------------------------------------
-FOLDER: support/
---------------------------------------------------------------------------------
+**4. Set `BASE` in each notebook's CONFIG cell** to your data root. This is
+a one-time edit per machine; after that, the only monthly edits are the
+lines marked `<-- MONTHLY EDIT`.
 
-PURPOSE
-  Consolidates support services data from multiple sources into a single
-  indicator_7_data.csv file, which is then used by the consolidation step.
-  A support service is any intervention Umuzi provides beyond direct earning
-  opportunities — coaching sessions, learning platform access, exam prep,
-  onboarding, CV assistance, and more.
+---
 
-NOTEBOOKS & SCRIPTS
-  Each source has its own notebook or query:
+## The monthly run
 
-  Source                    File                        Data owner / origin
-  ------------------------  --------------------------  ----------------------
-  Coursera completions      coursera_extraction.ipynb   Kennedy Kinyua (export)
-  LX Coach check-ins        lxcheckins.ipynb            LX team (Excel tracker)
-  Launch Lab sessions       placements.ipynb            Launch Lab team (Excel)
-  SAP support services      sap.ipynb                   SAP team (Excel tracker)
-  Database services         idc_indicator_7.sql         Data team (DB query)
-  Enrichment table          populate_fields.sql         Data team (DB query)
+**Step 0 — collect.** Data owners' submissions go into
+`<MONTH_DIR>/Source Datasets/`. Owners and their files: Natalie (XPL
+continuous-updates workbook — same file all year), Mitchell/Finance
+(Milestone), Kholofelo (Partnerships), Anchen (Launch Lab), the SAP,
+BeGreen, Heart, and LX teams, and Kennedy's Coursera export (a **folder**
+of per-pathway CSVs).
 
-INPUTS
+**Step 1 — queries.** Run the three files in `queries/` against the
+production database and export the results:
 
-- Source-specific Excel files or compressed exports (see individual READMEs)
-- Enrichment CSV from populate_fields.sql (shared across all notebooks)
+| Query | Export to |
+|---|---|
+| `populate_fields.sql` | `<BASE>/Improved IDC/Categories/Support/db_fields.csv` |
+| `idc_indicator_5.sql` | `<MONTH_DIR>/Database/indicator_5.csv` |
+| `idc_indicator_7.sql` | `<MONTH_DIR>/Database/indicator_7.csv` |
 
-OUTPUTS
+**Step 2 — notebooks, in this order.** The order is enforced, not optional:
+the consolidation notebook **creates** the workbook (`mode='w'`) and the
+earning notebook **appends** to it (`mode='a'`) — the earning notebook's
+pre-flight check refuses to run if the workbook does not exist yet.
 
-- indicator_7_data.csv (Sink Datasets) — each notebook appends to this file
-- indicator_7_sap_support_services.csv — standalone SAP export (optional)
-- indicator_7_coursera.csv — standalone Coursera export (optional)
-- indicator_7_lxcheckins.csv — standalone LX check-ins export (optional)
-- indicator_7_placements.csv — standalone Launch Lab export (optional)
+| # | Notebook | Edits before running | Produces |
+|---|---|---|---|
+| 1 | `support/support_services_consolidated.ipynb` | reporting period, `MONTH_DIR`, source filenames | `indicator_7_data.csv` |
+| 2 | `consolidate/indicators_consolidated.ipynb` | `MONTH_DIR` | creates the workbook: Indicator 5, 6, 7 + Support Participants List |
+| 3 | `earning/eos_refactored.ipynb` | `CURRENT_MONTH`, `MONTH_DIR`, `PREV_MONTH_DIR`, source filenames | appends: Learner Demographics, One Per Learner, Monthly Entries Breakdown, Summarized Opportunities, Earning Opportunities Secured |
 
-IMPORTANT NOTES
+> **Note for long-time runners:** this order **inverts** the old workflow,
+> which ran earning before consolidation. Running the old order now wipes
+> the earning sheets when the workbook is recreated.
 
-- All notebooks must be run before the consolidation step.
-- Each notebook appends to indicator_7_data.csv in Sink Datasets. Confirm
-    the file exists and is from the correct cycle before running.
-- SAP learners are identified by personal email, not Umuzi email. The
-    enrichment table must be up to date before running sap.ipynb.
-- The Coursera and LX check-ins notebooks have a hardcoded year in the
-    month_of_service_accessed field — update before running for a new
-    calendar year.
-- See each notebook's section in the SLAB documentation for full details,
-    quirks, and per-source run checklists.
+Run each notebook with *Restart & Run All*. Source filenames drift month to
+month ("Copy of" prefixes, owner names in brackets); when a path in CONFIG
+does not match, the notebooks fail before doing any work and print what is
+actually in `Source Datasets` so you can correct the name.
 
-RUN ORDER
+**Step 3 — validate and distribute.** A complete workbook has nine sheets
+(four from step 2, five from step 3). Review any WARN-level items in the
+final validation summaries — nameless learners, out-of-window dates,
+cross-source duplicates — before the report is shared.
 
-  1. Run populate_fields.sql and export the enrichment CSV first.
-  2. Run idc_indicator_7.sql and export the database services CSV.
-  3. Run all four Python notebooks in any order, confirming each appends
-     successfully to indicator_7_data.csv.
-  4. Proceed to consolidate/.
+---
 
---------------------------------------------------------------------------------
-FOLDER: consolidate/
---------------------------------------------------------------------------------
+## When a run halts
 
-PURPOSE
-  The final step. Reads all upstream outputs — Indicator 5 from the database,
-  the rolling Indicator 7 support services CSV, and the enrichment table —
-  and produces the complete IDC Report Consolidated.xlsx file. Also derives
-  Indicator 6 (unique learner headcount across all support services).
+All three notebooks share a fail-loud validation framework. A halt always
+ends with a table of failed checks; each row names the problem and the fix.
+The common ones:
 
-NOTEBOOK
-  indicators.ipynb
+| Halt | Fix |
+|---|---|
+| Missing input file(s) + a directory listing | Correct the filename in CONFIG using the listing |
+| Unmatched emails (support) | Follow the printed 3-option instructions: `EMAIL_CORRECTIONS`, `KNOWN_UNREPORTABLE_EMAILS`, or fix the database and re-export `db_fields.csv` |
+| Unmapped Coursera programmes | Add the printed Program Names to `COURSERA_COHORT_MAP` (or `COURSERA_DROP_SERVICES` if the cohort is employed) |
+| Unmapped cohorts (earning) | Add the printed labels to `remapCohort` |
+| Workbook does not exist (earning) | Run `consolidate/indicators_consolidated.ipynb` first — see run order |
+| result/breakdown reconciliation failure (earning) | Read the per-learner diff printed above the assert; do not distribute until it reconciles |
 
-INPUTS
+Warnings (WARN) print their offending rows but allow the run to finish —
+they are the "verify with a human" tier, not the "the data is broken" tier.
 
-- Enrichment CSV (from support/populate_fields.sql)
-- Indicator 5 CSV (from idc_indicator_5.sql)
-- indicator_7_data.csv — current cycle (from support/)
-- indicator_7_data.csv — previous cycle (from prior reporting period)
-- Database Indicator 7 CSV (from support/idc_indicator_7.sql)
+---
 
-OUTPUTS (written to IDC Report Consolidated.xlsx)
+## Outputs and the rolling files
 
-- Indicator 5   — Registered unemployed SA youth (one row per applicant)
-- Indicator 6   — Unique individuals who accessed a support service
-- Indicator 7   — All support service interactions (full granular detail)
-- Support Participants List — Demographic summary for IDC submission
+`<MONTH_DIR>/Sink Datasets/` after a full run contains:
 
-NOTE
-  The previous cycle file path is currently hardcoded in the notebook.
-  Update it to point to the correct prior cycle folder before running.
-  This path should not reference a local machine — store the previous
-  cycle's file in a shared location accessible to the full data team.
+- `IDC Report Consolidated Y2.xlsx` — the partner deliverable (9 sheets)
+- `indicator_7_data.csv` — consolidated support services (feeds step 2 and
+  next month's `prev_indicator_7` if a source goes non-cumulative)
+- `indicator_6_data.csv` — one row per supported learner
+- `combined_eos.csv` — the cleaned earning-opportunities frame. **Next
+  month's run reads this as `prev_combined`** — it is how single-month
+  submissions are stitched into the cumulative Y2 picture, with
+  already-covered re-reads dropped and genuine back-fills kept (and
+  reported).
 
-RUN ORDER
-  Run last, after both earning/ and support/ are complete. Both pipelines
-  write to the same IDC Report Consolidated.xlsx — confirm all expected
-  sheets are present before distributing the final file.
+The Y1 final export (`Monthly IDC/March(2026)/Sink Datasets/combined_eos.csv`)
+is the fixed baseline for the `Counted Y1` flag all year — learners present
+in it are `Counted` from their first Y2 row rather than consuming a new `1`
+in `Youth Count (1 vs Counted)`.
 
---------------------------------------------------------------------------------
-END-TO-END RUN ORDER (each reporting cycle)
---------------------------------------------------------------------------------
+## Known quirks (deliberate — do not "fix")
 
-  STEP 1 — DATABASE QUERIES (queries/)
-    a. Run populate_fields.sql → export enrichment CSV
-    b. Run idc_indicator_5.sql → export Indicator 5 CSV
-    c. Run idc_indicator_7.sql → export database Indicator 7 CSV
-    d. Distribute the enrichment CSV to anyone running Python notebooks
-
-  STEP 2 — SUPPORT SERVICES NOTEBOOKS (support/)
-    Run all four notebooks. Each appends to indicator_7_data.csv.
-    a. coursera_extraction.ipynb
-    b. lxcheckins.ipynb
-    c. placements.ipynb
-    d. sap.ipynb
-
-  STEP 3 — EARNING OPPORTUNITIES (earning/)
-    Run eos.ipynb. Writes its sheets to IDC Report Consolidated.xlsx.
-
-  STEP 4 — FINAL CONSOLIDATION (consolidate/)
-    Run indicators.ipynb. Writes Indicator 5, 6, 7, and Participants List
-    to IDC Report Consolidated.xlsx.
-
-  STEP 5 — VALIDATE & DISTRIBUTE
-    Confirm all expected sheets are present in IDC Report Consolidated.xlsx.
-    Review any null name fields flagged by indicators.ipynb.
-    Run the EOS reconciliation checks before sharing.
-
---------------------------------------------------------------------------------
-SHARED DEPENDENCIES
---------------------------------------------------------------------------------
-
-  Python packages:  pandas, numpy, openpyxl, pathlib
-  SQL database:     Umuzi production database (PostgreSQL)
-  Enrichment CSV:   Generated fresh each cycle from populate_fields.sql
-  Sink Datasets:    A folder (not committed to the repo) where all intermediate
-                    CSVs are written. Its location should be consistent across
-                    the team — agree on a shared path or drive location.
-
-  All file paths in the notebooks are left blank by default and must be set
-  before running. Do not commit populated paths to the repository, especially
-  paths that reference local machines or sensitive locations.
-
---------------------------------------------------------------------------------
-FURTHER READING
---------------------------------------------------------------------------------
-
-  earning/README.md        — Full EOS pipeline documentation
-  SLAB (internal)           — Complete technical SOP with pipeline diagrams,
-                              per-source documentation, SQL query explanations,
-                              and maintenance guidance for all scripts
-
-================================================================================
+- `apss.staus` in the SQL is the **actual production column name** (schema
+  misspelling). Correcting it breaks the queries.
+- The XA-Sept-25 cohort is exempt from duplicate removal in the earning
+  pipeline: identical-looking rows there are genuine repeat payments.
+- Natalie's XPL workbook grows **horizontally** — new months arrive as new
+  column blocks, not rows. The loader sizes itself to the sheet width;
+  never reintroduce hardcoded `usecols` there.
+- Umuzi's financial year runs April → March. All month ordering uses
+  `FY_MONTH_ORDER`, never calendar or alphabetical order.
