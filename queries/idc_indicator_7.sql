@@ -16,7 +16,172 @@
 --   WHERE aps.application_status_id IS NOT NULL
 --   ORDER BY aps.learner_id, aps.date_created DESC
 -- )
+-- ============================================================
+-- applications_to_use view (simplified)
+-- Replaces the two-CTE + NOT EXISTS version with a single
+-- DISTINCT ON using a priority sort: accepted applications win,
+-- ties broken by most recent date_created.
 
+-- ============================================================
+-- CREATE OR REPLACE VIEW applications_to_use AS
+-- SELECT DISTINCT ON (aps.learner_id)
+--   aps.*
+-- FROM applications aps
+-- JOIN application_status apss ON apss.id = aps.application_status_id
+-- ORDER BY
+--   aps.learner_id,
+--   (apss.staus = 'Accepted') DESC,   -- accepted first
+--   aps.date_created DESC;             -- then most recent
+
+
+-- ============================================================
+-- IDC Indicator 7: services accessed
+-- ============================================================
+WITH params AS (
+  SELECT DATE '2026-04-01' AS cutoff
+),
+
+-- ------------------------------------------------------------
+-- All demographic/eligibility logic lives here, once.
+-- Each service pipeline below only resolves learner_id,
+-- date_service_accessed, service_used, service_name.
+-- ------------------------------------------------------------
+eligible_learners AS (
+  SELECT
+    ll.id AS learner_id,
+    la.id AS application_id,
+    COALESCE(ll.umuzi_email, ll.email) AS umuzi_email,
+    ll.first_name,
+    ll.last_name,
+    ll.cellphone_number,
+    ll.id_number,
+    ll.gender,
+    ll.date_of_birth,
+    ll.race,
+    lrat.name AS residential_area_type,
+    ll.has_disability_or_differently_abled,
+    COALESCE(la.registration_date, la.date_updated) AS application_date,
+    cities.name AS nearest_metro,
+    provinces.name AS province
+  FROM learners ll
+  LEFT JOIN applications_to_use la
+    ON la.learner_id = ll.id
+  LEFT JOIN learner_miscellaneous_information lmi
+    ON lmi.learner_id = ll.id
+  LEFT JOIN lookup_residential_area_type lrat
+    ON lrat.id = lmi.residential_area_type_id
+  LEFT JOIN cities
+    ON cities.id = ll.nearest_city
+  LEFT JOIN provinces
+    ON provinces.id = NULLIF(TRIM(ll.province), '')::integer
+  WHERE (ll.is_south_african_citizen = TRUE OR ll.nationality = 'South African')
+    AND ll.is_currently_employed = FALSE
+    AND ll.test_account = FALSE
+),
+
+-- ------------------------------------------------------------
+-- Bootcamp pipeline
+-- NOTE: date_service_accessed anchors on bs.start_date; the
+-- original used rsvp_date for age_range but start_date for age --
+-- now consistent on start_date. Change here if RSVP is intended.
+-- ------------------------------------------------------------
+bootcamp_services AS (
+  SELECT
+    lbs.learner_id,
+    bs.start_date::timestamp AS date_service_accessed,
+    'Bootcamp'::text AS service_used,
+    b.bootcamp_name || '-bootcamp' AS service_name
+  FROM learners_bootcamps_slots lbs
+  JOIN bootcamps_slots bs ON bs.id = lbs.bootcamp_slot_id
+  JOIN bootcamp b ON b.id = bs.bootcamp_id
+  WHERE lbs.rsvp_date >= (SELECT cutoff FROM params)
+    AND (
+      lbs.bootcamp_result_id = 2
+      OR (lbs.bootcamp_result_id = 1 AND lbs.rejection_reason_id IS NOT NULL)
+    )
+),
+
+-- ------------------------------------------------------------
+-- Programme enrolment pipeline
+-- ------------------------------------------------------------
+programme_services AS (
+  SELECT
+    lpp.learner_id,
+    p.start_date::date AS date_service_accessed,
+    'programme enrollment'::text AS service_used,
+    p.name AS service_name
+  FROM learners_programmes_pathways lpp
+  JOIN programmes p ON p.id = lpp.programmes_id
+  WHERE (p.start_date >= (SELECT cutoff FROM params) OR p.start_date IS NULL)
+    AND p.name NOT ILIKE '%Accenture%'  -- counted in its own pipeline
+),
+
+-- ------------------------------------------------------------
+-- Accenture mini-course pipeline
+-- Uses MIN consistently = first verified upload per learner/course.
+-- GROUP BY is learner + course only, so a learner can no longer
+-- split into multiple rows via the age expression.
+-- ------------------------------------------------------------
+accenture_services AS (
+  SELECT
+    lcc.learner_id,
+    MIN(lcc.certificate_uploaded_at) AS date_service_accessed,
+    c.name::text AS service_used,
+    STRING_AGG(DISTINCT pw.name, ', ') AS service_name
+  FROM learners_courses_certificates lcc
+  JOIN courses c ON c.id = lcc.course_id
+  JOIN pathways_courses pc ON pc.course_id = lcc.course_id
+  JOIN pathways pw ON pw.id = pc.pathway_id
+  WHERE lcc.certificate_uploaded_at >= (SELECT cutoff FROM params)
+  GROUP BY lcc.learner_id, c.name
+),
+
+all_services AS (
+  SELECT * FROM bootcamp_services
+  UNION ALL
+  SELECT * FROM programme_services
+  UNION ALL
+  SELECT * FROM accenture_services
+)
+
+-- ------------------------------------------------------------
+-- Final projection: all date-derived fields computed exactly once
+-- from date_service_accessed, so they can never disagree.
+-- Inner join to eligible_learners applies the demographic filters.
+-- ------------------------------------------------------------
+SELECT
+  el.learner_id,
+  el.application_id,
+  s.date_service_accessed,
+  el.umuzi_email,
+  el.first_name,
+  el.last_name,
+  el.cellphone_number,
+  el.id_number,
+  el.gender,
+  el.date_of_birth,
+  EXTRACT(YEAR FROM AGE(s.date_service_accessed, el.date_of_birth)) AS age_service_accessed,
+  el.race,
+  el.residential_area_type,
+  el.has_disability_or_differently_abled,
+  el.application_date,
+  TO_CHAR(s.date_service_accessed, 'Month YYYY') AS month_of_service_accessed,
+  CASE
+    WHEN s.date_service_accessed IS NULL
+      OR el.date_of_birth IS NULL THEN 'Unknown'  -- was silently 'Over 50'
+    WHEN AGE(s.date_service_accessed, el.date_of_birth) < INTERVAL '18 years' THEN '17 and below'
+    WHEN AGE(s.date_service_accessed, el.date_of_birth) < INTERVAL '26 years' THEN '18-25'
+    WHEN AGE(s.date_service_accessed, el.date_of_birth) < INTERVAL '36 years' THEN '26-35'
+    WHEN AGE(s.date_service_accessed, el.date_of_birth) < INTERVAL '51 years' THEN '36-50'
+    ELSE 'Over 50'
+  END AS age_range,
+  el.nearest_metro,
+  el.province,
+  s.service_used,
+  s.service_name
+FROM all_services s
+JOIN eligible_learners el ON el.learner_id = s.learner_id
+ORDER BY el.learner_id, s.service_name NULLS FIRST;
 -- SELECT * 
 -- FROM LatestAcceptedApplication
 
